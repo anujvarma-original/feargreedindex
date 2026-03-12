@@ -3,13 +3,11 @@ import math
 import re
 from datetime import date
 from typing import Optional, Dict
-
 import numpy as np
 import pandas as pd
 import streamlit as st
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-
 
 # =============================
 # Streamlit page config
