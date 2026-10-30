@@ -6,7 +6,9 @@ from typing import Optional, Dict
 import numpy as np
 import pandas as pd
 import streamlit as st
-from urllib.parse import urlencode
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlsplit
+import time
 from urllib.request import Request, urlopen
 
 # =============================
@@ -65,11 +67,28 @@ run_button = st.sidebar.button("Run Strategy", type="primary")
 # Helpers
 # =============================
 def safe_fetch_text(url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> str:
+    host = urlsplit(url).hostname or "data provider"
+    source = (f"FRED ({params.get('series_id', 'series')})" if params and "stlouisfed" in host
+              else "CNN Fear & Greed" if "cnn" in host
+              else "Cboe put/call ratio" if "cboe" in host else host)
     if params:
         url = f"{url}?{urlencode(params)}"
     req = Request(url, headers=headers or HEADERS)
-    with urlopen(req, timeout=30) as response:
-        return response.read().decode("utf-8")
+    for attempt in range(3):
+        try:
+            with urlopen(req, timeout=15) as response:
+                return response.read().decode("utf-8")
+        except HTTPError as exc:
+            if exc.code in (429, 500, 502, 503, 504) and attempt < 2:
+                time.sleep(attempt + 1)
+                continue
+            # Do not expose the request URL: FRED URLs contain the API key.
+            raise RuntimeError(f"{source}: HTTP {exc.code}. The provider rejected or could not complete the request.") from None
+        except (URLError, TimeoutError):
+            if attempt < 2:
+                time.sleep(attempt + 1)
+                continue
+            raise RuntimeError(f"{source}: connection failed or timed out. Please retry shortly.") from None
 
 
 def safe_fetch_json(url: str, params: Optional[dict] = None, headers: Optional[dict] = None):
@@ -150,8 +169,8 @@ def fetch_fred_series(series_id: str, start_date_str: str, end_date_str: Optiona
 
 
 @st.cache_data(ttl=3600)
-def fetch_cnn_fear_greed(start_date_str: str) -> pd.DataFrame:
-    url = f"{CNN_FGI_URL}/{start_date_str}"
+def fetch_cnn_fear_greed(start_date_str: Optional[str]) -> pd.DataFrame:
+    url = f"{CNN_FGI_URL}/{start_date_str}" if start_date_str else CNN_FGI_URL
     payload = safe_fetch_json(
         url,
         headers={
@@ -224,7 +243,14 @@ def build_dataset(start_date_str: str, end_date_str: Optional[str]) -> pd.DataFr
         raise ValueError("End date must be on or after start date.")
     # Warm up the 200-session moving average before the requested test period.
     history_start = (start - pd.Timedelta(days=550)).date().isoformat()
-    fgi = fetch_cnn_fear_greed(history_start)
+    # Only price data needs the 200-session warm-up. CNN may reject older dates.
+    try:
+        fgi = fetch_cnn_fear_greed(start_date_str)
+    except RuntimeError:
+        try:
+            fgi = fetch_cnn_fear_greed(None)
+        except RuntimeError as exc:
+            raise RuntimeError(f"{exc} Both dated and default CNN history requests failed; backtest cannot run without sentiment history.") from None
     spx = fetch_fred_series("SP500", history_start, end_date_str).rename("sp500")
     vix = fetch_fred_series("VIXCLS", history_start, end_date_str).rename("vix")
     hy = fetch_fred_series("BAMLH0A0HYM2", history_start, end_date_str).rename("hy_oas")
