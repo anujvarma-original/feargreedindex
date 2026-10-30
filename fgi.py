@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 st.set_page_config(page_title="Fear & Greed Strategy", layout="wide")
 
 st.title("Fear & Greed Strategy Dashboard")
-st.caption("Streamlit Cloud version with no extra pip requirements file.")
+st.caption("Daily signals and backtest on aligned S&P 500 trading sessions.")
 
 
 # =============================
@@ -97,7 +97,7 @@ def performance_stats(ret: pd.Series, periods_per_year: int = 252) -> Dict[str, 
     sharpe = float(ann_return / ann_vol) if ann_vol > 0 else np.nan
 
     curve = (1.0 + ret).cumprod()
-    drawdown = curve / curve.cummax() - 1.0
+    drawdown = curve / curve.cummax().clip(lower=1.0) - 1.0
     max_dd = float(drawdown.min()) if not drawdown.empty else np.nan
 
     hit_rate = float((ret > 0).mean())
@@ -167,7 +167,7 @@ def fetch_cnn_fear_greed(start_date_str: str) -> pd.DataFrame:
         if not current:
             raise ValueError("CNN Fear & Greed payload did not contain expected fields.")
 
-        ts = pd.to_datetime(current["timestamp"], unit="ms")
+        ts = pd.to_datetime(current["timestamp"], unit="ms", utc=True).tz_convert(None)
         df = pd.DataFrame(
             [{
                 "date": ts.normalize(),
@@ -181,7 +181,7 @@ def fetch_cnn_fear_greed(start_date_str: str) -> pd.DataFrame:
     if "x" not in df.columns or "y" not in df.columns:
         raise ValueError(f"Unexpected CNN history format: columns={list(df.columns)}")
 
-    df["date"] = pd.to_datetime(df["x"], unit="ms").dt.normalize()
+    df["date"] = pd.to_datetime(df["x"], unit="ms", utc=True).dt.tz_convert(None).dt.normalize()
     df["fear_greed_score"] = pd.to_numeric(df["y"], errors="coerce")
     df["fear_greed_rating"] = df["rating"] if "rating" in df.columns else pd.NA
 
@@ -218,21 +218,37 @@ def fetch_cboe_put_call_ratio() -> float:
 # Strategy pipeline
 # =============================
 def build_dataset(start_date_str: str, end_date_str: Optional[str]) -> pd.DataFrame:
-    fgi = fetch_cnn_fear_greed(start_date_str)
+    start = pd.Timestamp(start_date_str).normalize()
+    end = pd.Timestamp(end_date_str or date.today()).normalize()
+    if end < start:
+        raise ValueError("End date must be on or after start date.")
+    # Warm up the 200-session moving average before the requested test period.
+    history_start = (start - pd.Timedelta(days=550)).date().isoformat()
+    fgi = fetch_cnn_fear_greed(history_start)
+    spx = fetch_fred_series("SP500", history_start, end_date_str).rename("sp500")
+    vix = fetch_fred_series("VIXCLS", history_start, end_date_str).rename("vix")
+    hy = fetch_fred_series("BAMLH0A0HYM2", history_start, end_date_str).rename("hy_oas")
 
-    spx = fetch_fred_series("SP500", start_date_str, end_date_str).rename("sp500")
-    vix = fetch_fred_series("VIXCLS", start_date_str, end_date_str).rename("vix")
-    hy = fetch_fred_series("BAMLH0A0HYM2", start_date_str, end_date_str).rename("hy_oas")
+    def daily(obj):
+        obj = obj.copy()
+        obj.index = pd.to_datetime(obj.index, utc=True).tz_convert(None).normalize()
+        return obj.loc[~obj.index.duplicated(keep="last")].sort_index()
 
-    df = pd.concat([fgi, spx, vix, hy], axis=1).sort_index()
-
-    df["fear_greed_score"] = df["fear_greed_score"].ffill()
-    df["vix"] = df["vix"].ffill()
-    df["hy_oas"] = df["hy_oas"].ffill()
-
-    df["sp500_200dma"] = df["sp500"].rolling(200).mean()
+    spx = daily(spx).dropna()
+    if len(spx) < 201:
+        raise ValueError("Not enough S&P 500 history for the 200-session trend filter.")
+    df = spx.to_frame()
+    # As-of alignment carries only earlier observations; never backfill future data.
+    for name, source in [("fear_greed_score", daily(fgi)["fear_greed_score"]),
+                         ("vix", daily(vix)), ("hy_oas", daily(hy))]:
+        source = pd.to_numeric(source, errors="coerce").dropna()
+        df[name] = source.reindex(df.index, method="ffill")
+    df["sp500_200dma"] = df["sp500"].rolling(200, min_periods=200).mean()
     df["trend_up"] = df["sp500"] > df["sp500_200dma"]
-    df["sp500_ret"] = df["sp500"].pct_change()
+    df["sp500_ret"] = df["sp500"].pct_change(fill_method=None)
+    df = df.loc[:end]
+    df.attrs["requested_start"] = start
+    df.attrs["requested_end"] = end
 
     return df
 
@@ -262,7 +278,7 @@ def compute_meo(df: pd.DataFrame) -> pd.DataFrame:
     df["S3_pcr"] = min_max_clip(s3)
     df["S4_hy"] = min_max_clip(s4)
 
-    df["MEO"] = df[["S1_fgi", "S2_vix", "S3_pcr", "S4_hy"]].mean(axis=1)
+    df["MEO"] = df[["S1_fgi", "S2_vix", "S3_pcr", "S4_hy"]].mean(axis=1, skipna=False)
     return df
 
 
@@ -302,6 +318,18 @@ def run_app():
         df = add_realtime_put_call_proxy(df)
         df = compute_meo(df)
         df = generate_positions(df)
+        # Lag positions before trimming, preserving the prior session's signal.
+        required = ["sp500_ret", "sp500_200dma", "fear_greed_score", "vix", "hy_oas", "MEO"]
+        requested = df.loc[start_date_str:end_date]
+        eligible = requested.dropna(subset=required)
+        if len(eligible) < 2:
+            raise ValueError("Fewer than two complete trading sessions. CNN may have returned only its current snapshot; historical data is required for performance.")
+        first = eligible.index.min()
+        if first > requested.index.min():
+            st.warning(f"Complete data starts on {first.date()}; earlier requested sessions are excluded.")
+        df = df.loc[first:eligible.index.max()].copy()
+        if df[required].isna().any().any():
+            raise ValueError("Missing inputs inside the backtest period. Performance was not calculated.")
         df = backtest(df)
 
     latest = df.dropna(subset=["sp500"]).iloc[-1]
@@ -322,13 +350,22 @@ def run_app():
     c7.metric("Next Position", f"{latest.get('position', np.nan):.2f}")
 
     st.subheader("Performance")
+    active = int(df["position_lag"].gt(0).sum())
+    entries = int((df["position_lag"].gt(0) & ~df["position_lag"].shift(1, fill_value=0).gt(0)).sum())
+    st.caption(f"{df.index.min().date()} to {df.index.max().date()} | {len(df)} trading sessions | {active} invested sessions | {entries} entries | Average exposure {df['position_lag'].mean():.1%}")
+    if active == 0:
+        st.warning("No entry signals met the existing MEO thresholds and uptrend rule. Strategy return is correctly zero; its volatility is zero and Sharpe is unavailable. Thresholds have not been changed.")
     perf_df = pd.DataFrame(
         {
             "Strategy": strat,
             "Buy & Hold": bh,
         }
     )
-    st.dataframe(perf_df.style.format("{:.4f}"), use_container_width=True)
+    formats = {key: ("{:.2f}" if key == "sharpe_like" else "{:.2%}") for key in perf_df.index}
+    styled = perf_df.style
+    for key, fmt in formats.items():
+        styled = styled.format(fmt, subset=pd.IndexSlice[[key], :], na_rep="N/A")
+    st.dataframe(styled, width="stretch")
 
     st.subheader("Equity Curves")
     st.line_chart(df[["strategy_curve", "buy_hold_curve"]].dropna())
@@ -344,7 +381,7 @@ def run_app():
         "fear_greed_score", "vix", "hy_oas", "put_call_ratio_proxy",
         "MEO", "trend_up", "position", "strategy_curve", "buy_hold_curve"
     ]
-    st.dataframe(df[show_cols].tail(50), use_container_width=True)
+    st.dataframe(df[show_cols].tail(50), width="stretch")
 
     csv_data = df.to_csv().encode("utf-8")
     st.download_button(
